@@ -285,6 +285,12 @@ func processInternalRequest(
 		return nil, errors.New("unknown batch request action")
 	}
 
+	// enforce the API key scope using the same semantics as the regular routes
+	// (regular JWT/record auth and guests pass through and are handled by the API rules)
+	if err := ensureBatchAPIKeyScope(baseEvent, ir.Method, params["collection"]); err != nil {
+		return nil, err
+	}
+
 	// construct a new http.Request
 	// ---------------------------------------------------------------
 	buf, mw, err := multipartDataFromInternalRequest(ir)

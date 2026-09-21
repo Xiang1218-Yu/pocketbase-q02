@@ -17,7 +17,7 @@ func bindRecordAuthApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
 		SkipSuccessActivityLog(), // skip success log as it could contain sensitive information in the url
 	)
 
-	sub := rg.Group("/collections/{collection}")
+	sub := rg.Group("/collections/{collection}").Bind(requireNoAPIKeyAuth())
 
 	sub.GET("/auth-methods", recordAuthMethods).Bind(
 		collectionPathRateLimit("", "listAuthMethods"),

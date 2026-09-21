@@ -547,6 +547,31 @@ type App interface {
 
 	// ---------------------------------------------------------------
 
+	// FindAPIKeyById returns a single APIKey model by its id.
+	FindAPIKeyById(id string) (*APIKey, error)
+
+	// FindAPIKeyByHash returns the active (non expired/revoked) APIKey
+	// model matching the provided irreversible key hash.
+	FindAPIKeyByHash(keyHash string) (*APIKey, error)
+
+	// FindAPIKeyByToken returns the active (non expired/revoked) APIKey
+	// model matching the provided plaintext key token.
+	FindAPIKeyByToken(token string) (*APIKey, error)
+
+	// FindAllAPIKeysByRecord returns all API keys linked to the provided auth record.
+	FindAllAPIKeysByRecord(authRecord *Record) ([]*APIKey, error)
+
+	// DeleteAllAPIKeysByRecord deletes all API keys associated with the provided record.
+	DeleteAllAPIKeysByRecord(authRecord *Record) error
+
+	// TouchAPIKey best-effort throttled update of the key last used metadata.
+	TouchAPIKey(key *APIKey, ip string) error
+
+	// DeleteExpiredAPIKeys deletes all API keys with past expiration date.
+	DeleteExpiredAPIKeys() error
+
+	// ---------------------------------------------------------------
+
 	// FindAllAuthOriginsByRecord returns all AuthOrigin models linked to the provided auth record (in DESC order).
 	FindAllAuthOriginsByRecord(authRecord *Record) ([]*AuthOrigin, error)
 

@@ -42,7 +42,8 @@ func bindFileApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 
 	sub := rg.Group("/files")
 	sub.POST("/token", api.fileToken).Bind(RequireAuth())
-	sub.GET("/{collection}/{recordId}/{filename}", api.download).Bind(collectionPathRateLimit("", "file"))
+	sub.GET("/{collection}/{recordId}/{filename}", api.download).
+		Bind(collectionPathRateLimit("", "file"), requireAPIKeyScope("file"))
 }
 
 type fileApi struct {
@@ -63,6 +64,12 @@ func (api *fileApi) fileToken(e *core.RequestEvent) error {
 	// extra check for just in case the handler is called in a different context
 	if e.Auth == nil {
 		return e.UnauthorizedError("Missing auth context.", nil)
+	}
+
+	// file tokens are JWTs tied to a specific auth record and are not issued
+	// for API keys (which authenticate file downloads directly instead)
+	if key, _ := e.Get(core.RequestEventKeyAPIKey).(*core.APIKey); key != nil {
+		return e.BadRequestError("File tokens cannot be issued for API keys.", nil)
 	}
 
 	token, err := e.Auth.NewFileToken()

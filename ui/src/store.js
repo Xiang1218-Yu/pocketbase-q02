@@ -63,6 +63,11 @@ window.app.store = store({
             label: "Collections",
         },
         {
+            href: "#/api-keys",
+            icon: "ri-key-2-line",
+            label: "API keys",
+        },
+        {
             href: "#/logs",
             icon: "ri-bar-chart-box-line",
             label: "Logs",

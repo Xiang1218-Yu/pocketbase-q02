@@ -73,6 +73,33 @@ func realtimeConnect(e *core.RequestEvent) error {
 	// could be used as an optional cross-reference check in other API endpoints
 	connectEvent.Client.Set(RealtimeClientIPKey, e.RealIP())
 
+	// carry over the API key identity so that it can be invalidated on revocation
+	// and re-validated against the current db state on each subscription change
+	if key, _ := e.Get(core.RequestEventKeyAPIKey).(*core.APIKey); key != nil {
+		connectEvent.Client.Set(core.RealtimeClientAPIKeyIdKey, key.Id)
+		if !key.ExpiresAt().IsZero() {
+			connectEvent.Client.Set(core.RealtimeClientAPIKeyExpiresKey, key.ExpiresAt().Unix())
+		}
+
+		// allow revocation/expiry enforcement to unblock the SSE loop
+		// even while it is waiting for the next message
+		connectEvent.Client.Set(core.RealtimeClientAPICancelKey, cancelRequest)
+
+		// expiry timer: drop the connection the moment the key expires
+		if !key.ExpiresAt().IsZero() {
+			d := time.Until(key.ExpiresAt().Time())
+			if d < 0 {
+				d = 0
+			}
+			time.AfterFunc(d, func() {
+				if id, _ := connectEvent.Client.Get(core.RealtimeClientAPIKeyIdKey).(string); id == key.Id {
+					connectEvent.Client.Discard()
+					cancelRequest()
+				}
+			})
+		}
+	}
+
 	return e.App.OnRealtimeConnectRequest().Trigger(connectEvent, func(ce *core.RealtimeConnectRequestEvent) error {
 		// register new subscription client
 		ce.App.SubscriptionsBroker().Register(ce.Client)
@@ -126,6 +153,17 @@ func realtimeConnect(e *core.RequestEvent) error {
 					// channel is closed
 					ce.App.Logger().Debug(
 						"Realtime connection closed (closed channel)",
+						slog.String("clientId", ce.Client.Id()),
+					)
+					return nil
+				}
+
+				// the client may have been forcefully discarded (e.g. revoked
+				// API key); Channel() returns the zero message after Discard()
+				// in some race conditions so check the flag explicitly too
+				if ce.Client.IsDiscarded() {
+					ce.App.Logger().Debug(
+						"Realtime connection closed (discarded client)",
 						slog.String("clientId", ce.Client.Id()),
 					)
 					return nil
@@ -219,6 +257,38 @@ func realtimeSetSubscriptions(e *core.RequestEvent) error {
 	clientAuth, _ := client.Get(RealtimeClientAuthKey).(*core.Record)
 	if clientAuth != nil && !isSameAuth(clientAuth, e.Auth) {
 		return e.ForbiddenError("The current and the previous request authorization don't match.", nil)
+	}
+
+	// API keys: the connection may have been established with a key that
+	// has since been revoked or expired; enforce re-auth against the db state
+	if apiKeyId, _ := client.Get(core.RealtimeClientAPIKeyIdKey).(string); apiKeyId != "" {
+		key, err := e.App.FindAPIKeyById(apiKeyId)
+		if err != nil || key.HasExpired(time.Now()) {
+			// the credential is gone - drop the client so the SSE loop exits
+			if cancel, ok := client.Get(core.RealtimeClientAPICancelKey).(context.CancelFunc); ok && cancel != nil {
+				cancel()
+			}
+			client.Unset(core.RealtimeClientAPIKeyIdKey)
+			client.Unset(core.RealtimeClientAPIKeyExpiresKey)
+			client.Unset(core.RealtimeClientAPICancelKey)
+			client.Unset(RealtimeClientAuthKey)
+			client.Unsubscribe()
+			client.Discard()
+
+			return newAPIKeyUnauthorizedError("The API key has been revoked or expired.", nil)
+		}
+
+		// the subscription request itself must be authenticated with the same key
+		// (or, for keys linked to a record, with the linked record)
+		requestKey, _ := e.Get(core.RequestEventKeyAPIKey).(*core.APIKey)
+		if requestKey == nil || requestKey.Id != key.Id {
+			return e.ForbiddenError("The realtime connection is bound to a different API key.", nil)
+		}
+
+		// enforce the "view" scope per requested topic
+		if err := checkAPIKeySubscriptionScopes(e.App, key, form.Subscriptions); err != nil {
+			return err
+		}
 	}
 
 	event := new(core.RealtimeSubscribeRequestEvent)
@@ -638,6 +708,16 @@ func realtimeBroadcastRecord(app core.App, action string, record *core.Record, d
 					clientAuth, _ = client.Get(RealtimeClientAuthKey).(*core.Record)
 
 					for sub, options := range subs {
+						// API key subscribers are re-checked against the key's current
+						// db state (revocation disconnects the client immediately via
+						// disconnectAPIKeyClients; expiration and scope narrowing are
+						// enforced here with a short-lived read cache)
+						if apiKeyId, _ := client.Get(core.RealtimeClientAPIKeyIdKey).(string); apiKeyId != "" {
+							if !realtimeClientAPIKeyCanView(accessCheckApp, client, apiKeyId, collection.Id, collection.Name) {
+								continue
+							}
+						}
+
 						// mock request data
 						requestInfo := &core.RequestInfo{
 							Context: core.RequestInfoContextRealtime,

@@ -31,6 +31,8 @@ func NewRouter(app core.App) (*router.Router[*core.RequestEvent], error) {
 	pbRouter.Bind(panicRecover())
 	pbRouter.Bind(rateLimit())
 	pbRouter.Bind(loadAuthToken())
+	pbRouter.Bind(loadAPIKey())
+	pbRouter.Bind(rejectExpiredAPIKey())
 	pbRouter.Bind(superuserIPsWhitelist())
 	pbRouter.Bind(securityHeaders())
 	pbRouter.Bind(BodyLimit(DefaultMaxBodySize))
@@ -49,6 +51,7 @@ func NewRouter(app core.App) (*router.Router[*core.RequestEvent], error) {
 	bindRealtimeApi(app, apiGroup)
 	bindHealthApi(app, apiGroup)
 	bindSQLApi(app, apiGroup)
+	bindAPIKeyApi(app, apiGroup)
 
 	// UI routes
 	bindUIExtensions(app)

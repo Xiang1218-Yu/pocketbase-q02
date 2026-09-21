@@ -26,11 +26,11 @@ import (
 // note: the rate limiter is "inlined" because some of the crud actions are also used in the batch APIs
 func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup := rg.Group("/collections/{collection}/records").Unbind(DefaultRateLimitMiddlewareId)
-	subGroup.GET("", recordsList)
-	subGroup.GET("/{id}", recordView)
-	subGroup.POST("", recordCreate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
-	subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
-	subGroup.DELETE("/{id}", recordDelete(true, nil))
+	subGroup.GET("", recordsList).Bind(requireAPIKeyScope("list"))
+	subGroup.GET("/{id}", recordView).Bind(requireAPIKeyScope("view"))
+	subGroup.POST("", recordCreate(true, nil)).Bind(requireAPIKeyScope("create"), dynamicCollectionBodyLimit(""))
+	subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(requireAPIKeyScope("update"), dynamicCollectionBodyLimit(""))
+	subGroup.DELETE("/{id}", recordDelete(true, nil)).Bind(requireAPIKeyScope("delete"))
 }
 
 func recordsList(e *core.RequestEvent) error {

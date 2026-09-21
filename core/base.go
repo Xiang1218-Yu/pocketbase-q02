@@ -1445,7 +1445,15 @@ func (app *BaseApp) registerBaseHooks() {
 	app.registerMFAHooks()
 	app.registerOTPHooks()
 	app.registerAuthOriginHooks()
+	app.registerAPIKeyHooks()
 	app.registerNotifyWatcherHooks()
+
+	// run hourly to cleanup expired api keys
+	app.Cron().Add("__pbAPIKeysCleanup__", "0 * * * *", func() {
+		if err := app.DeleteExpiredAPIKeys(); err != nil {
+			app.Logger().Warn("Failed to delete expired API keys", "error", err)
+		}
+	})
 }
 
 // getLoggerMinLevel returns the logger min level based on the
