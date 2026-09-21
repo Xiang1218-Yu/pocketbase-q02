@@ -53,6 +53,8 @@ const (
 	DefaultRequireSuperuserAuthMiddlewareId             = "pbRequireSuperuserAuth"
 	DefaultRequireSuperuserOrOwnerAuthMiddlewareId      = "pbRequireSuperuserOrOwnerAuth"
 	DefaultRequireSameCollectionContextAuthMiddlewareId = "pbRequireSameCollectionContextAuth"
+	DefaultRequireAPIKeyActionMiddlewareId              = "pbRequireAPIKeyAction"
+	DefaultDenyAPIKeyAuthMiddlewareId                   = "pbDenyAPIKeyAuth"
 )
 
 // RequireGuestOnly middleware requires a request to NOT have a valid
@@ -63,7 +65,7 @@ func RequireGuestOnly() *hook.Handler[*core.RequestEvent] {
 	return &hook.Handler[*core.RequestEvent]{
 		Id: DefaultRequireGuestOnlyMiddlewareId,
 		Func: func(e *core.RequestEvent) error {
-			if e.Auth != nil {
+			if e.Auth != nil || e.APIKey != nil {
 				return router.NewBadRequestError("The request can be accessed only by guests.", nil)
 			}
 
@@ -107,8 +109,16 @@ func requireAuth(optCollectionNames ...string) func(*core.RequestEvent) error {
 // a valid superuser Authorization header.
 func RequireSuperuserAuth() *hook.Handler[*core.RequestEvent] {
 	return &hook.Handler[*core.RequestEvent]{
-		Id:   DefaultRequireSuperuserAuthMiddlewareId,
-		Func: requireAuth(core.CollectionNameSuperusers),
+		Id: DefaultRequireSuperuserAuthMiddlewareId,
+		Func: func(e *core.RequestEvent) error {
+			// API keys can never be superusers (they can't be bound to
+			// superuser records), even if the owner record happens to exist
+			if e.APIKey != nil {
+				return e.ForbiddenError("Only superusers can perform this action.", nil)
+			}
+
+			return requireAuth(core.CollectionNameSuperusers)(e)
+		},
 	}
 }
 
@@ -196,11 +206,154 @@ func loadAuthToken() *hook.Handler[*core.RequestEvent] {
 				return e.Next()
 			}
 
+			// API keys are not JWTs and have a dedicated prefix
+			if strings.HasPrefix(token, core.APIKeyPrefix) {
+				loadAPIKeyAuth(e, token)
+				return e.Next()
+			}
+
 			record, err := e.App.FindAuthRecordByToken(token, core.TokenTypeAuth)
 			if err != nil {
 				e.App.Logger().Debug("loadAuthToken failure", "error", err)
 			} else if record != nil {
 				e.Auth = record
+			}
+
+			return e.Next()
+		},
+	}
+}
+
+// loadAPIKeyAuth resolves the provided plaintext API key and populates
+// e.APIKey (and e.Auth when the key is bound to an owner record).
+//
+// Revoked and expired keys are silently ignored, mirroring the JWT
+// invalid-token behavior. The per-request scope enforcement is done
+// by [RequireAPIKeyAction].
+func loadAPIKeyAuth(e *core.RequestEvent, token string) {
+	key, err := e.App.FindAPIKeyBySecret(token)
+	if err != nil {
+		e.App.Logger().Debug("loadAPIKeyAuth lookup failure", "error", err)
+		return
+	}
+
+	if key == nil {
+		e.App.Logger().Debug("loadAPIKeyAuth: unknown or mismatched api key")
+		return
+	}
+
+	if key.IsExpired(time.Now()) {
+		e.App.Logger().Debug("loadAPIKeyAuth: expired api key", "keyId", key.Id)
+		return
+	}
+
+	if key.IsRevoked() {
+		// revoked keys are rejected explicitly so that already established
+		// realtime connections can be torn down on the next use
+		return
+	}
+
+	e.APIKey = key
+
+	if key.OwnerRecordRef() != "" {
+		ownerCollection, err := e.App.FindCachedCollectionByNameOrId(key.OwnerCollectionRef())
+		if err == nil && ownerCollection != nil {
+			owner, err := e.App.FindRecordById(ownerCollection, key.OwnerRecordRef())
+			if err == nil && owner != nil {
+				e.Auth = owner
+			} else {
+				e.App.Logger().Debug(
+					"loadAPIKeyAuth: failed to load the key owner record",
+					"keyId", key.Id,
+					"error", err,
+				)
+			}
+		}
+	}
+
+	// best-effort, throttled "last used" timestamp;
+	// executed in a separate goroutine to avoid adding a DB roundtrip
+	// to every authenticated request hot path
+	keyId := key.Id
+	routine.FireAndForget(func() {
+		e.App.TouchAPIKeyLastUsedAt(keyId, apiKeyLastUsedThrottle)
+	})
+}
+
+// apiKeyLastUsedThrottle limits how often a single key lastUsedAt can be updated.
+const apiKeyLastUsedThrottle = 1 * time.Minute
+
+// RequireAPIKeyAction returns a middleware that, for requests authenticated
+// with an API key, enforces the key to have the specified action scope for
+// the collection resolved from the collectionPathParam route param
+// (default to "collection" if empty).
+//
+// Requests authenticated with a regular record token or as guests are
+// not affected and continue through the existing rule checks.
+func RequireAPIKeyAction(action string, collectionPathParam ...string) *hook.Handler[*core.RequestEvent] {
+	param := "collection"
+	if len(collectionPathParam) > 0 && collectionPathParam[0] != "" {
+		param = collectionPathParam[0]
+	}
+
+	return &hook.Handler[*core.RequestEvent]{
+		Id:   DefaultRequireAPIKeyActionMiddlewareId + "_" + action,
+		Func: requireAPIKeyAction(action, param),
+	}
+}
+
+func requireAPIKeyAction(action, collectionPathParam string) func(*core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		if e.APIKey == nil {
+			return e.Next()
+		}
+
+		if err := checkAPIKeyActionAccess(e.App, e.APIKey, action, e.Request.PathValue(collectionPathParam)); err != nil {
+			return err
+		}
+
+		return e.Next()
+	}
+}
+
+// checkAPIKeyActionAccess verifies that the provided API key allows the
+// specified action on the collection resolved from the given route
+// collection identifier (name or id).
+//
+// It is exported (within the package) for reuse by the batch processor
+// which constructs synthetic request events without re-running the
+// route middlewares.
+func checkAPIKeyActionAccess(app core.App, key *core.APIKey, action, collectionNameOrId string) error {
+	if key == nil {
+		return nil
+	}
+
+	collection, _ := app.FindCachedCollectionByNameOrId(collectionNameOrId)
+	if collection == nil {
+		return router.NewNotFoundError("Missing collection context.", nil)
+	}
+
+	if !key.CanAccess(collection, action) {
+		return router.NewForbiddenError(
+			"The API key is not allowed to perform this action.",
+			fmt.Errorf("the api key scope doesn't include the %s action for collection %s", action, collection.Name),
+		)
+	}
+
+	return nil
+}
+
+// DenyAPIKeyAuth middleware rejects requests authenticated with an API key.
+//
+// It is used on endpoints that require an interactive user identity
+// (e.g. auth-refresh, file token issuance, superuser-only system routes
+// rely on the fact that API keys can never resolve to a superuser record).
+func DenyAPIKeyAuth() *hook.Handler[*core.RequestEvent] {
+	return &hook.Handler[*core.RequestEvent]{
+		Id: DefaultDenyAPIKeyAuthMiddlewareId,
+		Func: func(e *core.RequestEvent) error {
+			if e.APIKey != nil {
+				return e.ForbiddenError("API keys cannot be used with this endpoint.", nil)
 			}
 
 			return e.Next()
@@ -436,6 +589,13 @@ func logRequest(event *core.RequestEvent, err error) {
 		}
 	} else {
 		attrs = append(attrs, slog.String("auth", ""))
+	}
+
+	// surface the (non-secret) API key id in the request log without
+	// ever logging the key itself
+	if event.APIKey != nil {
+		attrs = append(attrs, slog.String("apiKeyId", event.APIKey.Id))
+		attrs = append(attrs, slog.String("apiKeyName", event.APIKey.Name()))
 	}
 
 	if event.App.Settings().Logs.LogIP {

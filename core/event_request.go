@@ -23,6 +23,14 @@ type RequestEvent struct {
 
 	Auth *Record
 
+	// APIKey holds the API key used to authenticate the request (if any).
+	//
+	// When set, Auth may still be populated with the key's bound owner
+	// record (or nil for guest-scoped keys) and the regular API rules
+	// are additionally constrained by the key scopes
+	// (see also [apis.RequireAPIKeyAction]).
+	APIKey *APIKey
+
 	router.Event
 
 	mu sync.Mutex

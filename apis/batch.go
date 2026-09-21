@@ -242,6 +242,20 @@ func (p *batchProcessor) process(activeApp core.App, batch []*core.InternalReque
 			return nil
 		}
 
+		// enforce the API key scope (if the outer request used one)
+		// before constructing and executing the synthetic request
+		if p.baseEvent.APIKey != nil {
+			collection := ""
+			if params := extractBatchActionParams(batch[0]); params != nil {
+				collection = params["collection"]
+			}
+
+			if err := checkBatchAPIKeyAction(p.app, p.baseEvent.APIKey, batch[0], collection); err != nil {
+				p.failedIndex = i
+				return err
+			}
+		}
+
 		result, err := processInternalRequest(
 			activeApp,
 			p.baseEvent,
@@ -354,6 +368,7 @@ func processInternalRequest(
 	event := &core.RequestEvent{}
 	event.App = activeApp
 	event.Auth = baseEvent.Auth
+	event.APIKey = baseEvent.APIKey
 	event.SetAll(baseEvent.GetAll())
 
 	// load RequestInfo context
@@ -494,6 +509,65 @@ func prepareInternalAction(activeApp core.App, ir *core.InternalRequest, optNext
 	}
 
 	return nil, nil, false
+}
+
+// extractBatchActionParams returns the named regex parameters of the
+// batch action without constructing its handler (used for early API key
+// scope checks).
+func extractBatchActionParams(ir *core.InternalRequest) map[string]string {
+	full := strings.ToUpper(ir.Method) + " " + ir.URL
+
+	for re := range ValidBatchActions {
+		if params, ok := findNamedMatches(re, full); ok {
+			return params
+		}
+	}
+
+	return nil
+}
+
+// batchMethodToAPIKeyAction maps an internal batch request method to
+// the corresponding API key scope action.
+func batchMethodToAPIKeyAction(method string) string {
+	switch strings.ToUpper(method) {
+	case "GET":
+		return core.APIKeyActionList
+	case "POST":
+		return core.APIKeyActionCreate
+	case "PATCH", "PUT":
+		return core.APIKeyActionUpdate
+	case "DELETE":
+		return core.APIKeyActionDelete
+	default:
+		return ""
+	}
+}
+
+// checkBatchAPIKeyAction enforces the outer request API key scope for
+// a single batch internal request.
+//
+// For PUT "upsert" requests both the create and the update scopes are
+// required so that the key can't bypass either rule depending on
+// whether the target record exists.
+func checkBatchAPIKeyAction(app core.App, key *core.APIKey, ir *core.InternalRequest, collection string) error {
+	if key == nil {
+		return nil
+	}
+
+	action := batchMethodToAPIKeyAction(ir.Method)
+
+	if strings.EqualFold(ir.Method, "PUT") {
+		if err := checkAPIKeyActionAccess(app, key, core.APIKeyActionCreate, collection); err != nil {
+			return err
+		}
+		return checkAPIKeyActionAccess(app, key, core.APIKeyActionUpdate, collection)
+	}
+
+	if action == "" {
+		return router.NewForbiddenError("The API key is not allowed to perform this action.", nil)
+	}
+
+	return checkAPIKeyActionAccess(app, key, action, collection)
 }
 
 func findNamedMatches(re *regexp.Regexp, str string) (map[string]string, bool) {

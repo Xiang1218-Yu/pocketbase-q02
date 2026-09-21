@@ -41,8 +41,10 @@ func bindFileApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	}
 
 	sub := rg.Group("/files")
-	sub.POST("/token", api.fileToken).Bind(RequireAuth())
-	sub.GET("/{collection}/{recordId}/{filename}", api.download).Bind(collectionPathRateLimit("", "file"))
+	sub.POST("/token", api.fileToken).Bind(DenyAPIKeyAuth()).Bind(RequireAuth())
+	sub.GET("/{collection}/{recordId}/{filename}", api.download).
+		Bind(collectionPathRateLimit("", "file")).
+		Bind(RequireAPIKeyAction(core.APIKeyActionView, "collection"))
 }
 
 type fileApi struct {

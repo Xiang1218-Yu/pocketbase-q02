@@ -28,6 +28,10 @@ const clientsChunkSize = 150
 // RealtimeClientAuthKey is the name of the realtime client store key that holds its auth state.
 const RealtimeClientAuthKey = "auth"
 
+// RealtimeClientAPIKey is the name of the realtime client store key that
+// holds the API key used when the connection was authenticated with one.
+const RealtimeClientAPIKey = "apiKey"
+
 // RealtimeClientIPKey is the name of the realtime client store key that holds the IP of the connected client.
 const RealtimeClientIPKey = "pbRealtimeClientIP"
 
@@ -72,6 +76,12 @@ func realtimeConnect(e *core.RequestEvent) error {
 
 	// could be used as an optional cross-reference check in other API endpoints
 	connectEvent.Client.Set(RealtimeClientIPKey, e.RealIP())
+
+	// propagate the API key identity (if any) so that broadcasts can
+	// apply the same scope semantics as regular HTTP requests
+	if e.APIKey != nil {
+		connectEvent.Client.Set(RealtimeClientAPIKey, e.APIKey)
+	}
 
 	return e.App.OnRealtimeConnectRequest().Trigger(connectEvent, func(ce *core.RealtimeConnectRequestEvent) error {
 		// register new subscription client
@@ -217,6 +227,15 @@ func realtimeSetSubscriptions(e *core.RequestEvent) error {
 
 	// for now allow only guest->auth upgrades and any other auth change is forbidden
 	clientAuth, _ := client.Get(RealtimeClientAuthKey).(*core.Record)
+	clientAPIKey, _ := client.Get(RealtimeClientAPIKey).(*core.APIKey)
+
+	// a connection authenticated with an API key keeps the same key for its
+	// lifetime (revocation/expiration are enforced per broadcast); swapping
+	// the credential on an existing connection is never allowed
+	if (clientAPIKey != nil || e.APIKey != nil) && !isSameAPIKey(clientAPIKey, e.APIKey) {
+		return e.ForbiddenError("The current and the previous request authorization don't match.", nil)
+	}
+
 	if clientAuth != nil && !isSameAuth(clientAuth, e.Auth) {
 		return e.ForbiddenError("The current and the previous request authorization don't match.", nil)
 	}
@@ -229,6 +248,7 @@ func realtimeSetSubscriptions(e *core.RequestEvent) error {
 	return e.App.OnRealtimeSubscribeRequest().Trigger(event, func(e *core.RealtimeSubscribeRequestEvent) error {
 		// update auth state
 		e.Client.Set(RealtimeClientAuthKey, e.Auth)
+		e.Client.Set(RealtimeClientAPIKey, e.APIKey)
 
 		// unsubscribe from any previous existing subscriptions
 		e.Client.Unsubscribe()
@@ -305,6 +325,37 @@ func realtimeUnsetClientsAuthByRecordModelOrProxy(app core.App, authModel core.M
 	return group.Wait()
 }
 
+// realtimeUnsetClientsAPIKey removes the API key (and its associated
+// owner auth record) from all realtime clients that authenticated with
+// the provided key id.
+//
+// The SSE connections are not closed but are immediately downgraded to
+// guests and all of their existing subscriptions are dropped (the
+// client has to resubscribe, which for a revoked/expired key will be
+// re-evaluated as guest access on the next broadcast).
+func realtimeUnsetClientsAPIKey(app core.App, keyId string) error {
+	chunks := app.SubscriptionsBroker().ChunkedClients(clientsChunkSize)
+
+	group := new(errgroup.Group)
+
+	for _, chunk := range chunks {
+		group.Go(routine.SafeWrap(func() error {
+			for _, client := range chunk {
+				clientAPIKey, _ := client.Get(RealtimeClientAPIKey).(*core.APIKey)
+				if clientAPIKey != nil && clientAPIKey.Id == keyId {
+					client.Unset(RealtimeClientAPIKey)
+					client.Unset(RealtimeClientAuthKey)
+					client.Unsubscribe()
+				}
+			}
+
+			return nil
+		}))
+	}
+
+	return group.Wait()
+}
+
 // realtimeUnsetClientsAuthByCollection unsets the auth state of all authenticated clients related to the collection.
 func realtimeUnsetClientsAuthByCollection(app core.App, collection *core.Collection) error {
 	chunks := app.SubscriptionsBroker().ChunkedClients(clientsChunkSize)
@@ -328,6 +379,44 @@ func realtimeUnsetClientsAuthByCollection(app core.App, collection *core.Collect
 }
 
 func bindRealtimeEvents(app core.App) {
+	// drop the API key identity from realtime clients when the key is
+	// updated (e.g. revoked) or deleted - the SSE connection itself stays
+	// open but immediately loses its authenticated permissions and the
+	// per-broadcast recheck will stop delivering events
+	app.OnRecordAfterUpdateSuccess().Bind(&hook.Handler[*core.RecordEvent]{
+		Func: func(e *core.RecordEvent) error {
+			if e.Record.Collection().Name == core.CollectionNameAPIKeys {
+				if err := realtimeUnsetClientsAPIKey(e.App, e.Record.Id); err != nil {
+					app.Logger().Warn(
+						"Failed to update realtime clients associated to the updated API key",
+						slog.String("keyId", e.Record.Id),
+						slog.String("error", err.Error()),
+					)
+				}
+			}
+
+			return e.Next()
+		},
+		Priority: -99,
+	})
+
+	app.OnRecordAfterDeleteSuccess().Bind(&hook.Handler[*core.RecordEvent]{
+		Func: func(e *core.RecordEvent) error {
+			if e.Record.Collection().Name == core.CollectionNameAPIKeys {
+				if err := realtimeUnsetClientsAPIKey(e.App, e.Record.Id); err != nil {
+					app.Logger().Warn(
+						"Failed to remove realtime clients associated to the deleted API key",
+						slog.String("keyId", e.Record.Id),
+						slog.String("error", err.Error()),
+					)
+				}
+			}
+
+			return e.Next()
+		},
+		Priority: -99,
+	})
+
 	// reset the clients auth on collection secret change
 	// (@todo with the future tracking of old collections data consider replacing with *AfterUpdateSuccess to account for transaction rollback)
 	app.OnCollectionUpdate().Bind(&hook.Handler[*core.CollectionEvent]{
@@ -636,6 +725,28 @@ func realtimeBroadcastRecord(app core.App, action string, record *core.Record, d
 					}
 
 					clientAuth, _ = client.Get(RealtimeClientAuthKey).(*core.Record)
+					clientAPIKey, _ := client.Get(RealtimeClientAPIKey).(*core.APIKey)
+
+					// API key authenticated subscribers: re-check the credential on
+					// every broadcast so that revocation/expiration take effect even
+					// on long-lived SSE connections
+					//
+					// receiving realtime data is a read operation: specific-record
+					// topics ("col/id") require the "view" scope and collection
+					// wildcard topics ("col/*" and the deprecated "col" topic)
+					// additionally require "list"
+					if clientAPIKey != nil {
+						isWildcardTopic := strings.Contains(prefix, "/*?") ||
+							strings.HasSuffix(prefix, collection.Name+"?") ||
+							strings.HasSuffix(prefix, collection.Id+"?")
+						canReceive := realtimeAPIKeyCanReceive(accessCheckApp, clientAPIKey, core.APIKeyActionView, record.Collection())
+						if isWildcardTopic {
+							canReceive = canReceive && realtimeAPIKeyCanReceive(accessCheckApp, clientAPIKey, core.APIKeyActionList, record.Collection())
+						}
+						if !canReceive {
+							continue
+						}
+					}
 
 					for sub, options := range subs {
 						// mock request data
@@ -850,6 +961,58 @@ func isSameAuth(authA, authB *core.Record) bool {
 	}
 
 	return authA.Id == authB.Id && authA.Collection().Id == authB.Collection().Id
+}
+
+func isSameAPIKey(keyA, keyB *core.APIKey) bool {
+	if keyA == nil {
+		return keyB == nil
+	}
+
+	if keyB == nil {
+		return false
+	}
+
+	return keyA.Id == keyB.Id
+}
+
+// realtimeBroadcastActionToAPIKeyAction is kept for potential future
+// action-aware checks; realtime delivery currently uses read scopes.
+func realtimeBroadcastActionToAPIKeyAction(action string) string {
+	switch action {
+	case "create":
+		return core.APIKeyActionCreate
+	case "update":
+		return core.APIKeyActionUpdate
+	case "delete":
+		return core.APIKeyActionDelete
+	default:
+		return core.APIKeyActionView
+	}
+}
+
+// realtimeAPIKeyCanReceive re-checks an API key at broadcast time:
+// the key must still exist (not deleted), be active (not revoked/expired)
+// and its scope must allow the specified read action for the record's collection.
+//
+// This ensures that revoked or expired keys immediately stop receiving
+// events even when the SSE connection itself stays open.
+func realtimeAPIKeyCanReceive(app core.App, cachedKey *core.APIKey, action string, collection *core.Collection) bool {
+	if cachedKey == nil {
+		return false
+	}
+
+	// reload from DB to pick up revocation/expiration/deletion that
+	// happened after the connection (or the previous broadcast)
+	fresh, err := app.FindAPIKeyById(cachedKey.Id)
+	if err != nil || fresh == nil {
+		return false
+	}
+
+	if !fresh.IsActive(time.Now()) {
+		return false
+	}
+
+	return fresh.CanAccess(collection, action)
 }
 
 // realtimeCanAccessRecord checks if the subscription client has access to the specified record model.

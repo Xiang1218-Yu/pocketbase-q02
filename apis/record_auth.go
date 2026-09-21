@@ -19,6 +19,10 @@ func bindRecordAuthApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
 
 	sub := rg.Group("/collections/{collection}")
 
+	// API keys are script credentials and must never be able to mint,
+	// refresh or otherwise manipulate interactive auth sessions
+	sub.Bind(DenyAPIKeyAuth())
+
 	sub.GET("/auth-methods", recordAuthMethods).Bind(
 		collectionPathRateLimit("", "listAuthMethods"),
 	)

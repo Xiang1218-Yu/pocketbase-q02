@@ -567,6 +567,33 @@ type App interface {
 
 	// ---------------------------------------------------------------
 
+	// FindAPIKeyById returns a single APIKey model by its id.
+	FindAPIKeyById(id string) (*APIKey, error)
+
+	// FindAPIKeyByPrefix returns a single APIKey model by its non-secret lookup prefix.
+	//
+	// The caller must additionally verify the key digest via APIKey.VerifySecret().
+	FindAPIKeyByPrefix(keyPrefix string) (*APIKey, error)
+
+	// FindAPIKeyBySecret looks up an API key by its plaintext value and
+	// verifies the stored salted digest.
+	//
+	// Returns nil without error if the key doesn't exist or the secret doesn't match.
+	// The revocation and expiration state are not checked.
+	FindAPIKeyBySecret(plaintext string) (*APIKey, error)
+
+	// FindAllAPIKeysByRecord returns all APIKey models bound to the provided auth record.
+	FindAllAPIKeysByRecord(authRecord *Record) ([]*APIKey, error)
+
+	// FindAllAPIKeysByCollection returns all APIKey models bound to the provided auth collection.
+	FindAllAPIKeysByCollection(collection *Collection) ([]*APIKey, error)
+
+	// TouchAPIKeyLastUsedAt updates the "lastUsedAt" field of the API key,
+	// throttled to at most one update per the specified duration.
+	TouchAPIKeyLastUsedAt(keyId string, throttle time.Duration)
+
+	// ---------------------------------------------------------------
+
 	// RecordQuery returns a new Record select query from a collection model, id or name.
 	//
 	// In case a collection id or name is provided and that collection doesn't
